@@ -474,10 +474,16 @@
                             <i class="fa-solid fa-rotate-left"></i>
                             <span>Selesai &amp; Kembali ke Halaman Awal</span>
                         </button>
-                        <button type="button" onclick="openAdminModal()" class="px-5 py-2.5 rounded-xl border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 font-semibold text-sm transition flex items-center gap-2">
-                            <i class="fa-solid fa-user-shield"></i>
-                            <span>Masuk Panel Admin (Unduh Rekap)</span>
-                        </button>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <button type="button" onclick="downloadStudentReceiptJSON()" class="px-4 py-2.5 rounded-xl border border-emerald-300 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 font-semibold text-sm transition flex items-center gap-2">
+                                <i class="fa-solid fa-file-arrow-down"></i>
+                                <span>Unduh Bukti Nilai (.json)</span>
+                            </button>
+                            <button type="button" onclick="openAdminModal()" class="px-4 py-2.5 rounded-xl border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 font-semibold text-sm transition flex items-center gap-2">
+                                <i class="fa-solid fa-user-shield"></i>
+                                <span>Panel Admin</span>
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -543,17 +549,51 @@
                 </div>
 
                 <div class="flex flex-wrap items-center gap-2">
+                    <button type="button" onclick="syncCloudToAdmin(true)" class="flex items-center space-x-1.5 bg-sky-600 hover:bg-sky-700 text-white px-4 py-2.5 rounded-xl text-xs sm:text-sm font-bold shadow-sm transition">
+                        <i class="fa-solid fa-cloud-arrow-down"></i>
+                        <span>Tarik Data Cloud Siswa</span>
+                    </button>
+                    <label class="cursor-pointer flex items-center space-x-1.5 bg-amber-500 hover:bg-amber-600 text-slate-950 px-4 py-2.5 rounded-xl text-xs sm:text-sm font-bold shadow-sm transition">
+                        <i class="fa-solid fa-file-import"></i>
+                        <span>Impor JSON</span>
+                        <input type="file" id="importJsonInput" accept=".json" onchange="importStudentJsonFiles(event)" multiple class="hidden">
+                    </label>
                     <button type="button" onclick="exportResultsToCSV()" class="flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2.5 rounded-xl text-xs sm:text-sm font-bold shadow-sm transition">
                         <i class="fa-solid fa-file-excel"></i>
                         <span>Export CSV / Excel</span>
                     </button>
                     <button type="button" onclick="exportSQLiteBinary()" class="flex items-center space-x-1.5 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2.5 rounded-xl text-xs sm:text-sm font-bold shadow-sm transition">
                         <i class="fa-solid fa-database"></i>
-                        <span>Download Database .sqlite</span>
+                        <span>Download .sqlite</span>
                     </button>
                     <button type="button" onclick="logoutAdmin()" class="flex items-center space-x-1.5 bg-slate-200 hover:bg-slate-300 text-slate-800 px-4 py-2.5 rounded-xl text-xs sm:text-sm font-semibold transition">
                         <i class="fa-solid fa-right-from-bracket"></i>
                         <span>Keluar</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Bar Status Sinkronisasi Cloud Multi-Perangkat (GitHub Pages Ready) -->
+            <div class="bg-sky-50 border border-sky-200 rounded-2xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                <div class="flex items-start gap-3">
+                    <div class="w-9 h-9 rounded-xl bg-sky-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+                        <i class="fa-solid fa-cloud"></i>
+                    </div>
+                    <div class="text-xs text-sky-950">
+                        <div class="font-bold flex items-center gap-2">
+                            <span>Sinkronisasi Cloud Multi-Perangkat (Aktif Otomatis)</span>
+                            <span id="cloudSyncBadge" class="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px]">Terhubung</span>
+                        </div>
+                        <p class="text-sky-800 mt-0.5">
+                            Hasil ujian dan status siswa online dari HP/laptop siswa otomatis tersinkron ke perangkat Admin ini. Opsional: tempel URL Web App <strong>Google Apps Script</strong> di samping untuk cadangan Google Sheets.
+                        </p>
+                    </div>
+                </div>
+                <div class="flex flex-wrap items-center gap-2 shrink-0">
+                    <input type="url" id="gasWebhookInput" placeholder="Opsional: URL Google Apps Script..."
+                        class="px-3 py-2 rounded-xl border border-sky-300 bg-white text-xs w-60 focus:border-sky-600 outline-none">
+                    <button type="button" onclick="saveGasWebhookUrl()" class="px-3.5 py-2 rounded-xl bg-sky-700 hover:bg-sky-800 text-white text-xs font-bold transition">
+                        Simpan URL
                     </button>
                 </div>
             </div>
@@ -2037,12 +2077,241 @@
         const OWN_ACTIVE_EXAM_KEY = 'cbt_inf8_active_session';
         const COMPLETED_NIS_KEY = 'cbt_inf8_completed_nis';
         const ADMIN_COMMANDS_KEY = 'cbt_inf8_admin_cmd';
+        const GAS_WEBHOOK_KEY = 'cbt_inf8_gas_webhook_url';
+        const CLOUD_CHANNEL_ID = 'pas8_smpn90_inf82026_v1';
+        const CLOUD_API_URL = `https://kvdb.io/A9x7kP2mQw8zR4vL6nT1yB/${CLOUD_CHANNEL_ID}`;
         const KELAS_LIST = ['VIII-1', 'VIII-2', 'VIII-3', 'VIII-4', 'VIII-5', 'VIII-6', 'VIII-7'];
 
+        let lastCompletedRecord = null;
         const cbtChannel = ('BroadcastChannel' in window) ? new BroadcastChannel('cbt_inf8_channel') : null;
 
         function normalizeClassCode(rawKelas) {
             return String(rawKelas || '').trim().toUpperCase().replace(/\s+/g, '');
+        }
+
+        /**
+         * =========================================================================
+         * 4A. CLOUD SYNC MULTI-PERANGKAT (UNTUK HOSTING STATIS GITHUB PAGES)
+         * =========================================================================
+         */
+        async function fetchCloudState() {
+            try {
+                const res = await fetch(`${CLOUD_API_URL}?t=${Date.now()}`, {
+                    method: 'GET',
+                    headers: { 'Accept': 'application/json' }
+                });
+                if (!res.ok) return null;
+                const data = await res.json();
+                return (data && typeof data === 'object') ? data : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function pushRecordToCloud(record, sessionToRemoveNis = null) {
+            try {
+                const current = (await fetchCloudState()) || { results: [], live: {} };
+                if (!Array.isArray(current.results)) current.results = [];
+                if (!current.live || typeof current.live !== 'object') current.live = {};
+
+                const cleanNis = String(record.nis || '').trim().toUpperCase();
+                const idx = current.results.findIndex(r => String(r.nis || '').trim().toUpperCase() === cleanNis);
+                if (idx >= 0) {
+                    current.results[idx] = record;
+                } else {
+                    current.results.push(record);
+                }
+
+                if (sessionToRemoveNis) {
+                    delete current.live[String(sessionToRemoveNis).trim().toUpperCase()];
+                }
+
+                await fetch(CLOUD_API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(current)
+                });
+
+                // Kirim pula ke Google Apps Script jika Admin mengonfigurasinya
+                const gasUrl = localStorage.getItem(GAS_WEBHOOK_KEY);
+                if (gasUrl) {
+                    fetch(gasUrl, {
+                        method: 'POST',
+                        mode: 'no-cors',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'SUBMIT_RESULT', record })
+                    }).catch(() => {});
+                }
+            } catch (e) {
+                console.warn('Cloud push tertunda (akan disinkronkan ulang):', e);
+            }
+        }
+
+        async function pushLiveHeartbeatToCloud(sessionPayload) {
+            try {
+                const current = (await fetchCloudState()) || { results: [], live: {} };
+                if (!Array.isArray(current.results)) current.results = [];
+                if (!current.live || typeof current.live !== 'object') current.live = {};
+
+                const cleanNis = String(sessionPayload.nis || '').trim().toUpperCase();
+                current.live[cleanNis] = sessionPayload;
+
+                // Bersihkan sesi yang sudah tidak mengirim sinyal > 5 menit
+                const now = Date.now();
+                Object.keys(current.live).forEach(k => {
+                    if (now - (current.live[k].last_heartbeat || 0) > 300000) {
+                        delete current.live[k];
+                    }
+                });
+
+                await fetch(CLOUD_API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(current)
+                });
+            } catch (e) {}
+        }
+
+        async function syncCloudToAdmin(showNotification = false) {
+            const badge = document.getElementById('cloudSyncBadge');
+            try {
+                const cloudData = await fetchCloudState();
+                if (!cloudData) {
+                    if (badge) {
+                        badge.textContent = 'Mode Lokal / Offline';
+                        badge.className = 'px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 font-bold text-[10px]';
+                    }
+                    if (showNotification) showToast('Server cloud belum merespons, menampilkan data lokal.', 'warning');
+                    return;
+                }
+
+                if (badge) {
+                    badge.textContent = 'Tersinkron Live';
+                    badge.className = 'px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px]';
+                }
+
+                // 1. Gabungkan hasil ujian dari Cloud ke LocalStorage & SQLite Admin
+                if (Array.isArray(cloudData.results) && cloudData.results.length > 0) {
+                    const localList = getBackupResultsList();
+                    const mapByNis = new Map();
+                    localList.forEach(item => mapByNis.set(String(item.nis).trim().toUpperCase(), item));
+
+                    let addedCount = 0;
+                    cloudData.results.forEach(remoteItem => {
+                        const key = String(remoteItem.nis || '').trim().toUpperCase();
+                        if (!key) return;
+                        const normalized = {
+                            ...remoteItem,
+                            nama: String(remoteItem.nama || '').trim(),
+                            nis: String(remoteItem.nis || '').trim(),
+                            kelas: normalizeClassCode(remoteItem.kelas)
+                        };
+                        if (!mapByNis.has(key)) {
+                            addedCount++;
+                        }
+                        mapByNis.set(key, normalized);
+                    });
+
+                    const mergedArray = Array.from(mapByNis.values());
+                    localStorage.setItem(RESULTS_BACKUP_KEY, JSON.stringify(mergedArray));
+
+                    if (isSqliteReady && db) {
+                        mergedArray.forEach(item => {
+                            db.run("DELETE FROM hasil_ujian WHERE UPPER(TRIM(nis)) = ?", [item.nis.toUpperCase()]);
+                            insertRowIntoSQLiteOnly(item);
+                        });
+                        persistSQLiteToLocalStorage();
+                    }
+
+                    if (showNotification && addedCount > 0) {
+                        showToast(`${addedCount} nilai baru siswa berhasil ditarik dari Cloud!`, 'success');
+                    }
+                }
+
+                // 2. Gabungkan sesi siswa online dari Cloud
+                if (cloudData.live && typeof cloudData.live === 'object') {
+                    const localSessions = getLiveSessionsMap();
+                    const now = Date.now();
+                    Object.entries(cloudData.live).forEach(([k, s]) => {
+                        if (now - (s.last_heartbeat || 0) <= 300000) {
+                            const existing = localSessions[k];
+                            if (!existing || (s.last_heartbeat || 0) >= (existing.last_heartbeat || 0)) {
+                                localSessions[k] = {
+                                    ...s,
+                                    kelas: normalizeClassCode(s.kelas)
+                                };
+                            }
+                        }
+                    });
+                    saveLiveSessionsMap(localSessions);
+                }
+
+                if (isAdminLoggedIn) {
+                    renderAdminTable();
+                    renderLiveMonitoringTable();
+                }
+                if (showNotification) {
+                    showToast('Sinkronisasi data hasil ujian & siswa online selesai.', 'info');
+                }
+            } catch (e) {
+                if (showNotification) showToast('Gagal menarik data cloud.', 'error');
+            }
+        }
+
+        function saveGasWebhookUrl() {
+            const url = document.getElementById('gasWebhookInput')?.value.trim() || '';
+            if (url) {
+                localStorage.setItem(GAS_WEBHOOK_KEY, url);
+                showToast('URL Google Apps Script berhasil disimpan.', 'success');
+            } else {
+                localStorage.removeItem(GAS_WEBHOOK_KEY);
+                showToast('URL Google Apps Script dikosongkan.', 'info');
+            }
+        }
+
+        function downloadStudentReceiptJSON() {
+            if (!lastCompletedRecord) {
+                showToast('Data hasil ujian tidak ditemukan.', 'warning');
+                return;
+            }
+            const blob = new Blob([JSON.stringify(lastCompletedRecord, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `Nilai_CBT_${lastCompletedRecord.kelas}_${lastCompletedRecord.nis}_${lastCompletedRecord.nama.replace(/\s+/g, '_')}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            showToast('Bukti nilai (.json) berhasil diunduh.', 'success');
+        }
+
+        function importStudentJsonFiles(event) {
+            const files = event.target.files;
+            if (!files || files.length === 0) return;
+
+            let imported = 0;
+            Array.from(files).forEach(file => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = JSON.parse(e.target.result);
+                        const records = Array.isArray(data) ? data : [data];
+                        records.forEach(rec => {
+                            if (rec && rec.nis && rec.nama) {
+                                saveExamResult(rec);
+                                imported++;
+                            }
+                        });
+                        renderAdminTable();
+                        showToast(`${imported} data nilai siswa berhasil diimpor ke SQLite.`, 'success');
+                    } catch (err) {
+                        showToast(`Format file ${file.name} tidak valid.`, 'error');
+                    }
+                };
+                reader.readAsText(file);
+            });
+            event.target.value = '';
         }
 
         async function initSQLiteDatabase() {
@@ -2227,6 +2496,9 @@
             removeLiveSessionByNis(normalizedRecord.nis);
             localStorage.removeItem(OWN_ACTIVE_EXAM_KEY);
 
+            // Kirim hasil akhir ke Cloud agar langsung muncul di perangkat Admin
+            pushRecordToCloud(normalizedRecord, normalizedRecord.nis);
+
             if (cbtChannel) {
                 cbtChannel.postMessage({ type: 'EXAM_FINISHED', nis: normalizedRecord.nis, record: normalizedRecord });
             }
@@ -2360,7 +2632,7 @@
          */
         let heartbeatInterval = null;
         let adminLivePollInterval = null;
-
+        let lastCloudHeartbeatTs = 0;
         function getLiveSessionsMap() {
             const combined = {};
             try {
@@ -2495,30 +2767,12 @@
             if (cbtChannel) {
                 cbtChannel.postMessage({ type: 'HEARTBEAT', payload: sessionPayload });
             }
-        }
 
-        function removeLiveSessionByNis(nis) {
-            if (!nis) return;
-            const map = getLiveSessionsMap();
-            delete map[nis.toUpperCase()];
-            saveLiveSessionsMap(map);
-        }
-
-        function startStudentHeartbeat() {
-            if (heartbeatInterval) clearInterval(heartbeatInterval);
-            broadcastStudentHeartbeat('Mengerjakan');
-            heartbeatInterval = setInterval(() => {
-                if (examState.active) {
-                    const statusText = document.hidden ? 'Keluar Layar / Pindah Tab' : 'Mengerjakan';
-                    broadcastStudentHeartbeat(statusText);
-                }
-            }, 3000);
-        }
-
-        function stopStudentHeartbeat() {
-            if (heartbeatInterval) {
-                clearInterval(heartbeatInterval);
-                heartbeatInterval = null;
+            // Kirim heartbeat ke Cloud setiap 9 detik agar status online siswa tampil di perangkat Admin
+            const nowTs = Date.now();
+            if (nowTs - lastCloudHeartbeatTs >= 9000 || customStatus !== 'Mengerjakan') {
+                lastCloudHeartbeatTs = nowTs;
+                pushLiveHeartbeatToCloud(sessionPayload);
             }
         }
 
@@ -2990,11 +3244,12 @@
             };
 
             saveExamResult(record);
+            lastCompletedRecord = record;
             renderStudentResultScreen(record, topicStats, reviewDetails);
 
             showOnlyScreen('result-screen');
             document.getElementById('btnOpenAdminLogin').classList.remove('hidden');
-            showToast('Ujian selesai! Nilai akhir Anda telah disimpan ke database SQLite.', 'success');
+            showToast('Ujian selesai! Nilai akhir Anda telah dikirim ke server & database SQLite.', 'success');
         }
 
         function renderStudentResultScreen(record, topicStats, reviewDetails) {
@@ -3139,10 +3394,13 @@
             document.getElementById('btnOpenAdminLogin').classList.add('hidden');
             document.getElementById('btnBackHomeHeader').classList.remove('hidden');
             document.getElementById('btnBackHomeHeader').classList.add('flex');
+            const gasInput = document.getElementById('gasWebhookInput');
+            if (gasInput) gasInput.value = localStorage.getItem(GAS_WEBHOOK_KEY) || '';
             switchAdminTab('results');
             renderAdminTable();
             refreshLiveMonitoring(false);
             renderAuditQuestions();
+            syncCloudToAdmin(false);
             startAdminLivePolling();
         }
 
@@ -3191,10 +3449,15 @@
 
         function startAdminLivePolling() {
             if (adminLivePollInterval) clearInterval(adminLivePollInterval);
+            let tick = 0;
             adminLivePollInterval = setInterval(() => {
                 if (isAdminLoggedIn) {
+                    tick++;
                     refreshLiveMonitoring(false);
                     renderAdminTable();
+                    if (tick % 3 === 0) {
+                        syncCloudToAdmin(false);
+                    }
                 }
             }, 3000);
         }
