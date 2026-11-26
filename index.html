@@ -582,7 +582,7 @@
                     <div class="text-xs text-sky-950">
                         <div class="font-bold flex items-center gap-2">
                             <span>Sinkronisasi Cloud Multi-Perangkat (Aktif Otomatis)</span>
-                            <span id="cloudSyncBadge" class="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px]">Terhubung</span>
+                            <span id="cloudSyncBadge" class="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px]">Memeriksa...</span>
                         </div>
                         <p class="text-sky-800 mt-0.5">
                             Hasil ujian dan status siswa online dari HP/laptop siswa otomatis tersinkron ke perangkat Admin ini. Opsional: tempel URL Web App <strong>Google Apps Script</strong> di samping untuk cadangan Google Sheets.
@@ -2078,8 +2078,11 @@
         const COMPLETED_NIS_KEY = 'cbt_inf8_completed_nis';
         const ADMIN_COMMANDS_KEY = 'cbt_inf8_admin_cmd';
         const GAS_WEBHOOK_KEY = 'cbt_inf8_gas_webhook_url';
-        const CLOUD_CHANNEL_ID = 'pas8_smpn90_inf82026_v1';
-        const CLOUD_API_URL = `https://kvdb.io/A9x7kP2mQw8zR4vL6nT1yB/${CLOUD_CHANNEL_ID}`;
+        const PENDING_QUEUE_KEY = 'cbt_inf8_pending_cloud_queue';
+        const CLOUD_BLOB_ID_KEY = 'cbt_inf8_cloud_blob_id';
+        const CLOUD_TOPIC = 'pas8_smpn90_inf82026_stream_v2';
+        const NTFY_PUBLISH_URL = `https://ntfy.sh/${CLOUD_TOPIC}`;
+        const NTFY_POLL_URL = `https://ntfy.sh/${CLOUD_TOPIC}/json?poll=1&since=24h`;
         const KELAS_LIST = ['VIII-1', 'VIII-2', 'VIII-3', 'VIII-4', 'VIII-5', 'VIII-6', 'VIII-7'];
 
         let lastCompletedRecord = null;
@@ -2091,128 +2094,170 @@
 
         /**
          * =========================================================================
-         * 4A. CLOUD SYNC MULTI-PERANGKAT (UNTUK HOSTING STATIS GITHUB PAGES)
+         * 4A. CLOUD SYNC MULTI-PERANGKAT (CORS-FREE STREAM + ANTREAN OTOMATIS)
+         *     Menjamin nilai siswa dari HP/Laptop langsung masuk ke Panel Admin
          * =========================================================================
          */
-        async function fetchCloudState() {
+        function enqueuePendingCloudItem(item) {
             try {
-                const res = await fetch(`${CLOUD_API_URL}?t=${Date.now()}`, {
-                    method: 'GET',
-                    headers: { 'Accept': 'application/json' }
+                const q = JSON.parse(localStorage.getItem(PENDING_QUEUE_KEY) || '[]');
+                q.push({ ...item, queuedAt: Date.now() });
+                localStorage.setItem(PENDING_QUEUE_KEY, JSON.stringify(q.slice(-100)));
+            } catch (e) {}
+        }
+
+        async function flushPendingCloudQueue() {
+            try {
+                const q = JSON.parse(localStorage.getItem(PENDING_QUEUE_KEY) || '[]');
+                if (!Array.isArray(q) || q.length === 0) return;
+                const remaining = [];
+                for (const item of q) {
+                    const ok = await sendCloudEventDirect(item);
+                    if (!ok) remaining.push(item);
+                }
+                localStorage.setItem(PENDING_QUEUE_KEY, JSON.stringify(remaining));
+            } catch (e) {}
+        }
+
+        async function sendCloudEventDirect(eventPayload) {
+            let success = false;
+            // Jalur 1: Public Event Stream (ntfy.sh) tanpa memicu preflight OPTIONS yang bisa ditolak
+            try {
+                const res = await fetch(NTFY_PUBLISH_URL, {
+                    method: 'POST',
+                    body: JSON.stringify(eventPayload)
                 });
-                if (!res.ok) return null;
-                const data = await res.json();
-                return (data && typeof data === 'object') ? data : null;
+                if (res.ok) success = true;
             } catch (e) {
-                return null;
+                try {
+                    await fetch(NTFY_PUBLISH_URL, {
+                        method: 'POST',
+                        mode: 'no-cors',
+                        body: JSON.stringify(eventPayload)
+                    });
+                    success = true;
+                } catch (e2) {}
             }
+
+            // Jalur 2: Google Apps Script Webhook (jika Admin mengisi URL Google Sheets)
+            const gasUrl = localStorage.getItem(GAS_WEBHOOK_KEY);
+            if (gasUrl) {
+                try {
+                    await fetch(gasUrl, {
+                        method: 'POST',
+                        mode: 'no-cors',
+                        headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+                        body: JSON.stringify(eventPayload)
+                    });
+                    success = true;
+                } catch (e) {}
+            }
+
+            return success;
         }
 
         async function pushRecordToCloud(record, sessionToRemoveNis = null) {
-            try {
-                const current = (await fetchCloudState()) || { results: [], live: {} };
-                if (!Array.isArray(current.results)) current.results = [];
-                if (!current.live || typeof current.live !== 'object') current.live = {};
+            // Ringkas payload agar ringan dan cepat terkirim dari jaringan seluler siswa
+            const compactRecord = { ...record };
+            delete compactRecord.detail_jawaban_json;
 
-                const cleanNis = String(record.nis || '').trim().toUpperCase();
-                const idx = current.results.findIndex(r => String(r.nis || '').trim().toUpperCase() === cleanNis);
-                if (idx >= 0) {
-                    current.results[idx] = record;
-                } else {
-                    current.results.push(record);
-                }
+            const payload = {
+                type: 'SUBMIT_RESULT',
+                ts: Date.now(),
+                removeNis: sessionToRemoveNis ? String(sessionToRemoveNis).trim().toUpperCase() : null,
+                record: compactRecord
+            };
 
-                if (sessionToRemoveNis) {
-                    delete current.live[String(sessionToRemoveNis).trim().toUpperCase()];
-                }
-
-                await fetch(CLOUD_API_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(current)
-                });
-
-                // Kirim pula ke Google Apps Script jika Admin mengonfigurasinya
-                const gasUrl = localStorage.getItem(GAS_WEBHOOK_KEY);
-                if (gasUrl) {
-                    fetch(gasUrl, {
-                        method: 'POST',
-                        mode: 'no-cors',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ action: 'SUBMIT_RESULT', record })
-                    }).catch(() => {});
-                }
-            } catch (e) {
-                console.warn('Cloud push tertunda (akan disinkronkan ulang):', e);
+            const sent = await sendCloudEventDirect(payload);
+            if (!sent) {
+                enqueuePendingCloudItem(payload);
+            } else {
+                flushPendingCloudQueue();
             }
         }
 
         async function pushLiveHeartbeatToCloud(sessionPayload) {
-            try {
-                const current = (await fetchCloudState()) || { results: [], live: {} };
-                if (!Array.isArray(current.results)) current.results = [];
-                if (!current.live || typeof current.live !== 'object') current.live = {};
-
-                const cleanNis = String(sessionPayload.nis || '').trim().toUpperCase();
-                current.live[cleanNis] = sessionPayload;
-
-                // Bersihkan sesi yang sudah tidak mengirim sinyal > 5 menit
-                const now = Date.now();
-                Object.keys(current.live).forEach(k => {
-                    if (now - (current.live[k].last_heartbeat || 0) > 300000) {
-                        delete current.live[k];
-                    }
-                });
-
-                await fetch(CLOUD_API_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(current)
-                });
-            } catch (e) {}
+            const payload = {
+                type: 'HEARTBEAT',
+                ts: Date.now(),
+                session: sessionPayload
+            };
+            await sendCloudEventDirect(payload);
         }
 
         async function syncCloudToAdmin(showNotification = false) {
             const badge = document.getElementById('cloudSyncBadge');
             try {
-                const cloudData = await fetchCloudState();
-                if (!cloudData) {
-                    if (badge) {
-                        badge.textContent = 'Mode Lokal / Offline';
-                        badge.className = 'px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 font-bold text-[10px]';
-                    }
-                    if (showNotification) showToast('Server cloud belum merespons, menampilkan data lokal.', 'warning');
-                    return;
+                await flushPendingCloudQueue();
+
+                const res = await fetch(`${NTFY_POLL_URL}&_=${Date.now()}`, {
+                    method: 'GET',
+                    cache: 'no-store'
+                });
+
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}`);
                 }
 
-                if (badge) {
-                    badge.textContent = 'Tersinkron Live';
-                    badge.className = 'px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px]';
-                }
+                const rawText = await res.text();
+                const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
 
-                // 1. Gabungkan hasil ujian dari Cloud ke LocalStorage & SQLite Admin
-                if (Array.isArray(cloudData.results) && cloudData.results.length > 0) {
-                    const localList = getBackupResultsList();
-                    const mapByNis = new Map();
-                    localList.forEach(item => mapByNis.set(String(item.nis).trim().toUpperCase(), item));
+                const remoteResultsMap = new Map();
+                const remoteLiveMap = {};
+                const finishedNisSet = new Set();
 
-                    let addedCount = 0;
-                    cloudData.results.forEach(remoteItem => {
-                        const key = String(remoteItem.nis || '').trim().toUpperCase();
-                        if (!key) return;
-                        const normalized = {
-                            ...remoteItem,
-                            nama: String(remoteItem.nama || '').trim(),
-                            nis: String(remoteItem.nis || '').trim(),
-                            kelas: normalizeClassCode(remoteItem.kelas)
-                        };
-                        if (!mapByNis.has(key)) {
-                            addedCount++;
+                lines.forEach(line => {
+                    try {
+                        const envelope = JSON.parse(line);
+                        if (!envelope || !envelope.message) return;
+                        const evt = JSON.parse(envelope.message);
+                        if (!evt || !evt.type) return;
+
+                        if (evt.type === 'SUBMIT_RESULT' && evt.record && evt.record.nis) {
+                            const cleanNis = String(evt.record.nis).trim().toUpperCase();
+                            remoteResultsMap.set(cleanNis, {
+                                ...evt.record,
+                                nama: String(evt.record.nama || '').trim(),
+                                nis: String(evt.record.nis || '').trim(),
+                                kelas: normalizeClassCode(evt.record.kelas)
+                            });
+                            finishedNisSet.add(cleanNis);
+                            delete remoteLiveMap[cleanNis];
+                        } else if (evt.type === 'HEARTBEAT' && evt.session && evt.session.nis) {
+                            const cleanNis = String(evt.session.nis).trim().toUpperCase();
+                            if (!finishedNisSet.has(cleanNis)) {
+                                const prev = remoteLiveMap[cleanNis];
+                                if (!prev || (evt.session.last_heartbeat || 0) >= (prev.last_heartbeat || 0)) {
+                                    remoteLiveMap[cleanNis] = {
+                                        ...evt.session,
+                                        kelas: normalizeClassCode(evt.session.kelas)
+                                    };
+                                }
+                            }
                         }
-                        mapByNis.set(key, normalized);
+                    } catch (parseErr) {}
+                });
+
+                // Gabungkan nilai dari Cloud ke LocalStorage & SQLite Admin
+                let addedCount = 0;
+                if (remoteResultsMap.size > 0) {
+                    const localList = getBackupResultsList();
+                    const combinedMap = new Map();
+                    localList.forEach(item => {
+                        combinedMap.set(String(item.nis || '').trim().toUpperCase(), item);
                     });
 
-                    const mergedArray = Array.from(mapByNis.values());
+                    remoteResultsMap.forEach((remoteItem, key) => {
+                        if (!combinedMap.has(key)) {
+                            addedCount++;
+                        }
+                        combinedMap.set(key, {
+                            ...(combinedMap.get(key) || {}),
+                            ...remoteItem
+                        });
+                    });
+
+                    const mergedArray = Array.from(combinedMap.values());
                     localStorage.setItem(RESULTS_BACKUP_KEY, JSON.stringify(mergedArray));
 
                     if (isSqliteReady && db) {
@@ -2222,44 +2267,56 @@
                         });
                         persistSQLiteToLocalStorage();
                     }
-
-                    if (showNotification && addedCount > 0) {
-                        showToast(`${addedCount} nilai baru siswa berhasil ditarik dari Cloud!`, 'success');
-                    }
                 }
 
-                // 2. Gabungkan sesi siswa online dari Cloud
-                if (cloudData.live && typeof cloudData.live === 'object') {
-                    const localSessions = getLiveSessionsMap();
-                    const now = Date.now();
-                    Object.entries(cloudData.live).forEach(([k, s]) => {
-                        if (now - (s.last_heartbeat || 0) <= 300000) {
-                            const existing = localSessions[k];
-                            if (!existing || (s.last_heartbeat || 0) >= (existing.last_heartbeat || 0)) {
-                                localSessions[k] = {
-                                    ...s,
-                                    kelas: normalizeClassCode(s.kelas)
-                                };
-                            }
+                // Gabungkan sesi siswa online dari Cloud (yang aktif < 5 menit terakhir)
+                const localSessions = getLiveSessionsMap();
+                const now = Date.now();
+                finishedNisSet.forEach(fNis => {
+                    delete localSessions[fNis];
+                });
+                Object.entries(remoteLiveMap).forEach(([k, s]) => {
+                    if (now - (s.last_heartbeat || 0) <= 300000) {
+                        const existing = localSessions[k];
+                        if (!existing || (s.last_heartbeat || 0) >= (existing.last_heartbeat || 0)) {
+                            localSessions[k] = s;
                         }
-                    });
-                    saveLiveSessionsMap(localSessions);
+                    }
+                });
+                saveLiveSessionsMap(localSessions);
+
+                if (badge) {
+                    badge.textContent = `Terhubung • ${remoteResultsMap.size} Data Cloud`;
+                    badge.className = 'px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 font-bold text-[10px]';
                 }
 
                 if (isAdminLoggedIn) {
                     renderAdminTable();
                     renderLiveMonitoringTable();
                 }
+
                 if (showNotification) {
-                    showToast('Sinkronisasi data hasil ujian & siswa online selesai.', 'info');
+                    if (addedCount > 0) {
+                        showToast(`Berhasil menarik ${addedCount} nilai baru siswa dari Cloud!`, 'success');
+                    } else {
+                        showToast(`Sinkronisasi selesai (${remoteResultsMap.size} data cloud diperiksa).`, 'info');
+                    }
                 }
             } catch (e) {
-                if (showNotification) showToast('Gagal menarik data cloud.', 'error');
+                if (badge) {
+                    badge.textContent = 'Mode Lokal / Cek Koneksi';
+                    badge.className = 'px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 font-bold text-[10px]';
+                }
+                if (showNotification) {
+                    showToast('Koneksi cloud tertunda, menampilkan data lokal SQLite.', 'warning');
+                }
             }
         }
 
         function saveGasWebhookUrl() {
-            const url = document.getElementById('gasWebhookInput')?.value.trim() || '';
+            const input = document.getElementById('gasWebhookInput');
+            if (!input) return;
+            const url = input.value.trim();
             if (url) {
                 localStorage.setItem(GAS_WEBHOOK_KEY, url);
                 showToast('URL Google Apps Script berhasil disimpan.', 'success');
@@ -2269,49 +2326,48 @@
             }
         }
 
-        function downloadStudentReceiptJSON() {
-            if (!lastCompletedRecord) {
-                showToast('Data hasil ujian tidak ditemukan.', 'warning');
-                return;
+        function persistSQLiteToLocalStorage() {
+            if (!isSqliteReady || !db) return;
+            try {
+                const binaryArray = db.export();
+                let binaryStr = '';
+                const chunkSize = 0x8000;
+                for (let i = 0; i < binaryArray.length; i += chunkSize) {
+                    binaryStr += String.fromCharCode.apply(null, binaryArray.subarray(i, i + chunkSize));
+                }
+                localStorage.setItem(SQLITE_STORAGE_KEY, btoa(binaryStr));
+            } catch (e) {
+                console.warn('Gagal persist SQLite:', e);
             }
-            const blob = new Blob([JSON.stringify(lastCompletedRecord, null, 2)], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `Nilai_CBT_${lastCompletedRecord.kelas}_${lastCompletedRecord.nis}_${lastCompletedRecord.nama.replace(/\s+/g, '_')}.json`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            showToast('Bukti nilai (.json) berhasil diunduh.', 'success');
         }
 
-        function importStudentJsonFiles(event) {
-            const files = event.target.files;
-            if (!files || files.length === 0) return;
-
-            let imported = 0;
-            Array.from(files).forEach(file => {
-                const reader = new FileReader();
-                reader.onload = (e) => {
-                    try {
-                        const data = JSON.parse(e.target.result);
-                        const records = Array.isArray(data) ? data : [data];
-                        records.forEach(rec => {
-                            if (rec && rec.nis && rec.nama) {
-                                saveExamResult(rec);
-                                imported++;
-                            }
-                        });
-                        renderAdminTable();
-                        showToast(`${imported} data nilai siswa berhasil diimpor ke SQLite.`, 'success');
-                    } catch (err) {
-                        showToast(`Format file ${file.name} tidak valid.`, 'error');
-                    }
-                };
-                reader.readAsText(file);
-            });
-            event.target.value = '';
+        function insertRowIntoSQLiteOnly(record) {
+            if (!isSqliteReady || !db) return;
+            try {
+                const stmt = db.prepare(`
+                    INSERT INTO hasil_ujian (
+                        nama, nis, kelas, waktu_mulai, waktu_selesai, durasi_detik,
+                        benar, salah, kosong, skor_total, pelanggaran, detail_jawaban_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `);
+                stmt.run([
+                    record.nama,
+                    record.nis,
+                    normalizeClassCode(record.kelas),
+                    record.waktu_mulai,
+                    record.waktu_selesai,
+                    Number(record.durasi_detik || 0),
+                    Number(record.benar || 0),
+                    Number(record.salah || 0),
+                    Number(record.kosong || 0),
+                    Number(record.skor_total || 0),
+                    Number(record.pelanggaran || 0),
+                    record.detail_jawaban_json || '{}'
+                ]);
+                stmt.free();
+            } catch (e) {
+                console.warn('Insert SQLite error:', e);
+            }
         }
 
         async function initSQLiteDatabase() {
@@ -2367,24 +2423,11 @@
                     );
                 `);
 
-                // Rekonsiliasi dua arah antara cadangan localStorage dan SQLite
                 const backupList = getBackupResultsList();
                 const resCount = db.exec("SELECT COUNT(*) FROM hasil_ujian");
                 const sqliteCount = resCount.length ? resCount[0].values[0][0] : 0;
                 if (backupList.length > 0 && sqliteCount === 0) {
                     backupList.forEach(item => insertRowIntoSQLiteOnly(item));
-                } else if (sqliteCount > 0 && backupList.length === 0) {
-                    const resAll = db.exec("SELECT * FROM hasil_ujian ORDER BY id ASC");
-                    if (resAll.length) {
-                        const cols = resAll[0].columns;
-                        const synced = resAll[0].values.map(row => {
-                            const obj = {};
-                            cols.forEach((c, i) => obj[c] = row[i]);
-                            obj.kelas = normalizeClassCode(obj.kelas);
-                            return obj;
-                        });
-                        localStorage.setItem(RESULTS_BACKUP_KEY, JSON.stringify(synced));
-                    }
                 }
 
                 syncLiveSessionsToSQLiteTable();
@@ -2401,58 +2444,13 @@
 
             if (isAdminLoggedIn) {
                 renderAdminTable();
-                renderLiveMonitoringTable();
             }
             restoreActiveSessionIfAny();
         }
 
-        function persistSQLiteToLocalStorage() {
-            if (!db) return;
-            try {
-                const binary = db.export();
-                let str = '';
-                const bytes = new Uint8Array(binary);
-                for (let i = 0; i < bytes.byteLength; i++) {
-                    str += String.fromCharCode(bytes[i]);
-                }
-                localStorage.setItem(SQLITE_STORAGE_KEY, btoa(str));
-            } catch (e) {}
-        }
-
-        function insertRowIntoSQLiteOnly(record) {
-            const normalizedKelas = normalizeClassCode(record.kelas);
-            const stmt = db.prepare(`
-                INSERT INTO hasil_ujian (
-                    nama, nis, kelas, waktu_mulai, waktu_selesai, durasi_detik,
-                    benar, salah, kosong, skor_total, pelanggaran, detail_jawaban_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `);
-            stmt.run([
-                String(record.nama || '').trim(),
-                String(record.nis || '').trim(),
-                normalizedKelas,
-                record.waktu_mulai,
-                record.waktu_selesai,
-                record.durasi_detik,
-                record.benar,
-                record.salah,
-                record.kosong,
-                record.skor_total,
-                record.pelanggaran || 0,
-                record.detail_jawaban_json || '{}'
-            ]);
-            stmt.free();
-        }
-
         function getBackupResultsList() {
             try {
-                const raw = JSON.parse(localStorage.getItem(RESULTS_BACKUP_KEY) || '[]');
-                return Array.isArray(raw) ? raw.map(r => ({
-                    ...r,
-                    nama: String(r.nama || '').trim(),
-                    nis: String(r.nis || '').trim(),
-                    kelas: normalizeClassCode(r.kelas)
-                })) : [];
+                return JSON.parse(localStorage.getItem(RESULTS_BACKUP_KEY) || '[]');
             } catch (e) {
                 return [];
             }
@@ -2468,7 +2466,7 @@
             };
 
             const backupList = getBackupResultsList();
-            const existingIdx = backupList.findIndex(r => r.nis.toUpperCase() === normalizedRecord.nis.toUpperCase());
+            const existingIdx = backupList.findIndex(r => String(r.nis).trim().toUpperCase() === normalizedRecord.nis.toUpperCase());
             if (existingIdx >= 0) {
                 backupList[existingIdx] = normalizedRecord;
             } else {
@@ -2482,7 +2480,6 @@
                 persistSQLiteToLocalStorage();
             }
 
-            // Kunci NIS (One-Attempt Lock)
             const completedMap = JSON.parse(localStorage.getItem(COMPLETED_NIS_KEY) || '{}');
             completedMap[normalizedRecord.nis.toUpperCase()] = {
                 nama: normalizedRecord.nama,
@@ -2496,7 +2493,7 @@
             removeLiveSessionByNis(normalizedRecord.nis);
             localStorage.removeItem(OWN_ACTIVE_EXAM_KEY);
 
-            // Kirim hasil akhir ke Cloud agar langsung muncul di perangkat Admin
+            // Kirim hasil ujian ke Cloud untuk dipantau Admin lintas perangkat
             pushRecordToCloud(normalizedRecord, normalizedRecord.nis);
 
             if (cbtChannel) {
@@ -2505,7 +2502,7 @@
         }
 
         function checkStudentAlreadyCompleted(nis) {
-            const cleanNis = nis.trim().toUpperCase();
+            const cleanNis = String(nis || '').trim().toUpperCase();
             if (isSqliteReady && db) {
                 const stmt = db.prepare("SELECT * FROM hasil_ujian WHERE UPPER(TRIM(nis)) = ? LIMIT 1");
                 stmt.bind([cleanNis]);
@@ -2521,61 +2518,49 @@
                 return completedMap[cleanNis];
             }
             const backupList = getBackupResultsList();
-            return backupList.find(r => r.nis.toUpperCase() === cleanNis) || null;
+            return backupList.find(r => String(r.nis || '').trim().toUpperCase() === cleanNis) || null;
         }
 
         function getAllExamResults() {
             const backupRows = getBackupResultsList();
-            const mergedMap = new Map();
-
-            backupRows.forEach(r => {
-                const key = String(r.nis || r.id).trim().toUpperCase();
-                mergedMap.set(key, {
-                    ...r,
-                    nama: String(r.nama || '').trim(),
-                    nis: String(r.nis || '').trim(),
-                    kelas: normalizeClassCode(r.kelas)
-                });
-            });
-
             if (isSqliteReady && db) {
-                try {
-                    const res = db.exec("SELECT * FROM hasil_ujian ORDER BY id DESC");
-                    if (res.length) {
-                        const cols = res[0].columns;
-                        res[0].values.forEach(row => {
-                            const obj = {};
-                            cols.forEach((c, i) => obj[c] = row[i]);
-                            obj.nama = String(obj.nama || '').trim();
-                            obj.nis = String(obj.nis || '').trim();
-                            obj.kelas = normalizeClassCode(obj.kelas);
-                            const key = obj.nis.toUpperCase();
-                            if (!mergedMap.has(key)) {
-                                mergedMap.set(key, obj);
-                            } else {
-                                mergedMap.set(key, { ...mergedMap.get(key), id: obj.id });
-                            }
-                        });
-
-                        if (mergedMap.size > res[0].values.length) {
-                            const existingSqliteNis = new Set(
-                                res[0].values.map(r => String(r[cols.indexOf('nis')] || '').trim().toUpperCase())
-                            );
-                            mergedMap.forEach((val, nisKey) => {
-                                if (!existingSqliteNis.has(nisKey)) {
-                                    insertRowIntoSQLiteOnly(val);
-                                }
-                            });
-                            persistSQLiteToLocalStorage();
+                const res = db.exec("SELECT * FROM hasil_ujian ORDER BY id DESC");
+                let sqliteRows = [];
+                if (res.length) {
+                    const cols = res[0].columns;
+                    sqliteRows = res[0].values.map(row => {
+                        const obj = {};
+                        cols.forEach((c, i) => obj[c] = row[i]);
+                        obj.kelas = normalizeClassCode(obj.kelas);
+                        return obj;
+                    });
+                }
+                if (backupRows.length > sqliteRows.length) {
+                    const existingNis = new Set(sqliteRows.map(r => String(r.nis).trim().toUpperCase()));
+                    let added = false;
+                    backupRows.forEach(b => {
+                        if (!existingNis.has(String(b.nis).trim().toUpperCase())) {
+                            insertRowIntoSQLiteOnly(b);
+                            added = true;
                         }
-                    } else if (mergedMap.size > 0) {
-                        mergedMap.forEach(val => insertRowIntoSQLiteOnly(val));
+                    });
+                    if (added) {
                         persistSQLiteToLocalStorage();
+                        const refreshed = db.exec("SELECT * FROM hasil_ujian ORDER BY id DESC");
+                        if (refreshed.length) {
+                            const rCols = refreshed[0].columns;
+                            return refreshed[0].values.map(row => {
+                                const obj = {};
+                                rCols.forEach((c, i) => obj[c] = row[i]);
+                                obj.kelas = normalizeClassCode(obj.kelas);
+                                return obj;
+                            });
+                        }
                     }
-                } catch (e) {}
+                }
+                if (sqliteRows.length > 0) return sqliteRows;
             }
-
-            return Array.from(mergedMap.values()).sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
+            return backupRows.map(r => ({ ...r, kelas: normalizeClassCode(r.kelas) })).reverse();
         }
 
         function deleteExamResultById(id) {
@@ -2592,14 +2577,14 @@
             }
 
             let backupList = getBackupResultsList();
-            const found = backupList.find(r => r.id === id || (deletedNis && r.nis.toUpperCase() === deletedNis.toUpperCase()));
+            const found = backupList.find(r => r.id === id || (deletedNis && String(r.nis).toUpperCase() === String(deletedNis).toUpperCase()));
             if (found && !deletedNis) deletedNis = found.nis;
-            backupList = backupList.filter(r => r.id !== id && (!deletedNis || r.nis.toUpperCase() !== deletedNis.toUpperCase()));
+            backupList = backupList.filter(r => r.id !== id && (!deletedNis || String(r.nis).toUpperCase() !== String(deletedNis).toUpperCase()));
             localStorage.setItem(RESULTS_BACKUP_KEY, JSON.stringify(backupList));
 
             if (deletedNis) {
                 const completedMap = JSON.parse(localStorage.getItem(COMPLETED_NIS_KEY) || '{}');
-                delete completedMap[deletedNis.toUpperCase()];
+                delete completedMap[String(deletedNis).toUpperCase()];
                 localStorage.setItem(COMPLETED_NIS_KEY, JSON.stringify(completedMap));
             }
 
@@ -2625,84 +2610,134 @@
             showToast('Seluruh database hasil ujian Kelas 8 & kunci percobaan berhasil dikosongkan.', 'success');
         }
 
-        /**
-         * =========================================================================
-         * 4B. REAL-TIME MONITORING SESI AKTIF & ANTI-REFRESH SESSION RECOVERY
-         * =========================================================================
-         */
-        let heartbeatInterval = null;
-        let adminLivePollInterval = null;
-        let lastCloudHeartbeatTs = 0;
-        function getLiveSessionsMap() {
-            const combined = {};
-            try {
-                const primary = JSON.parse(localStorage.getItem(ACTIVE_SESSIONS_KEY) || '{}');
-                Object.assign(combined, primary);
-            } catch (e) {}
-            try {
-                const legacy = JSON.parse(localStorage.getItem(LEGACY_SESSIONS_KEY) || '{}');
-                Object.assign(combined, legacy);
-            } catch (e) {}
+        function downloadStudentReceiptJSON() {
+            if (!lastCompletedRecord) {
+                showToast('Data bukti nilai belum tersedia.', 'warning');
+                return;
+            }
+            const blob = new Blob([JSON.stringify(lastCompletedRecord, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `Bukti_Nilai_${lastCompletedRecord.kelas}_${lastCompletedRecord.nis}_${lastCompletedRecord.nama.replace(/\s+/g, '_')}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            showToast('Bukti nilai JSON berhasil diunduh.', 'success');
+        }
 
-            // Sertakan pula sesi aktif dari tabel SQLite sesi_aktif jika ada
-            if (isSqliteReady && db) {
-                try {
-                    const res = db.exec("SELECT * FROM sesi_aktif");
-                    if (res.length) {
-                        const cols = res[0].columns;
-                        res[0].values.forEach(row => {
-                            const obj = {};
-                            cols.forEach((c, i) => obj[c] = row[i]);
-                            const key = String(obj.nis || '').trim().toUpperCase();
-                            if (key && (!combined[key] || (obj.last_heartbeat || 0) > (combined[key].last_heartbeat || 0))) {
-                                combined[key] = {
-                                    ...obj,
-                                    kelas: normalizeClassCode(obj.kelas)
-                                };
+        function importStudentJsonFiles(event) {
+            const files = event.target.files;
+            if (!files || files.length === 0) return;
+
+            let importedCount = 0;
+            Array.from(files).forEach(file => {
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const data = JSON.parse(e.target.result);
+                        const records = Array.isArray(data) ? data : [data];
+                        records.forEach(rec => {
+                            if (rec && rec.nis && rec.nama && rec.skor_total !== undefined) {
+                                saveExamResult(rec);
+                                importedCount++;
                             }
                         });
+                        renderAdminTable();
+                        showToast(`${importedCount} berkas nilai siswa berhasil diimpor ke SQLite.`, 'success');
+                    } catch (err) {
+                        showToast(`Gagal membaca file ${file.name}.`, 'error');
                     }
-                } catch (e) {}
-            }
-
-            // Pastikan sesi milik tab aktif sendiri selalu tercantum jika ujian sedang berjalan
-            if (examState && examState.active && examState.student && examState.student.nis) {
-                const ownKey = examState.student.nis.trim().toUpperCase();
-                combined[ownKey] = {
-                    nis: examState.student.nis.trim(),
-                    nama: examState.student.nama.trim(),
-                    kelas: normalizeClassCode(examState.student.kelas),
-                    waktu_mulai: examState.startTimeStr,
-                    soal_sekarang: examState.currentIndex + 1,
-                    terjawab: Object.keys(examState.answers).length,
-                    total_soal: examState.questions.length,
-                    sisa_detik: examState.remainingSeconds,
-                    pelanggaran: examState.violations,
-                    status: document.hidden ? 'Keluar Layar / Pindah Tab' : 'Mengerjakan',
-                    last_heartbeat: Date.now()
                 };
-            }
-
-            // Normalisasi kelas seluruh entri
-            Object.keys(combined).forEach(k => {
-                if (combined[k]) {
-                    combined[k].kelas = normalizeClassCode(combined[k].kelas);
-                }
+                reader.readAsText(file);
             });
+            event.target.value = '';
+        }
 
-            return combined;
+        /**
+         * =========================================================================
+         * 4B. REAL-TIME MONITORING SESI ONLINE & STATE UJIAN SISWA
+         * =========================================================================
+         */
+        const EXAM_TOKEN = 'INF82026';
+        let heartbeatInterval = null;
+        let adminLivePollInterval = null;
+
+        let examState = {
+            active: false,
+            enteredFullscreenAtLeastOnce: false,
+            student: { nama: '', nis: '', kelas: '' },
+            startTimeStr: '',
+            questions: [],
+            answers: {},
+            doubts: {},
+            currentIndex: 0,
+            totalSeconds: 75 * 60,
+            remainingSeconds: 75 * 60,
+            violations: 0,
+            timerInterval: null,
+            fontSize: 'md'
+        };
+
+        function fillTokenQuick() {
+            const inp = document.getElementById('inputToken');
+            if (inp) {
+                inp.value = EXAM_TOKEN;
+                document.getElementById('tokenErrorMsg').classList.add('hidden');
+                showToast('Token ujian INF82026 diterapkan.', 'info');
+            }
+        }
+
+        function shuffleArray(arr) {
+            const copy = arr.slice();
+            for (let i = copy.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [copy[i], copy[j]] = [copy[j], copy[i]];
+            }
+            return copy;
+        }
+
+        function buildShuffledExamQuestions() {
+            const shuffledQuestions = shuffleArray(QUESTION_BANK);
+            return shuffledQuestions.map(q => {
+                const indexedOptions = q.options.map((text, idx) => ({
+                    text,
+                    isCorrect: idx === q.answer
+                }));
+                const shuffledOptions = shuffleArray(indexedOptions);
+                const newCorrectIndex = shuffledOptions.findIndex(o => o.isCorrect);
+                return {
+                    id: q.id,
+                    topic: q.topic,
+                    level: q.level,
+                    stimulusKey: q.stimulusKey,
+                    question: q.question,
+                    options: shuffledOptions.map(o => o.text),
+                    correctIndex: newCorrectIndex
+                };
+            });
+        }
+
+        function getLiveSessionsMap() {
+            try {
+                const primary = JSON.parse(localStorage.getItem(ACTIVE_SESSIONS_KEY) || '{}');
+                const legacy = JSON.parse(localStorage.getItem(LEGACY_SESSIONS_KEY) || '{}');
+                return { ...legacy, ...primary };
+            } catch (e) {
+                return {};
+            }
         }
 
         function saveLiveSessionsMap(map) {
             localStorage.setItem(ACTIVE_SESSIONS_KEY, JSON.stringify(map));
-            localStorage.setItem(LEGACY_SESSIONS_KEY, JSON.stringify(map));
-            syncLiveSessionsToSQLiteTable(map);
+            syncLiveSessionsToSQLiteTable();
         }
 
-        function syncLiveSessionsToSQLiteTable(preloadedMap = null) {
+        function syncLiveSessionsToSQLiteTable() {
             if (!isSqliteReady || !db) return;
             try {
-                const map = preloadedMap || getLiveSessionsMap();
+                const map = getLiveSessionsMap();
                 db.run("DELETE FROM sesi_aktif");
                 const stmt = db.prepare(`
                     INSERT OR REPLACE INTO sesi_aktif (
@@ -2712,8 +2747,8 @@
                 `);
                 Object.values(map).forEach(s => {
                     stmt.run([
-                        String(s.nis || '').trim(),
-                        String(s.nama || '').trim(),
+                        s.nis,
+                        s.nama,
                         normalizeClassCode(s.kelas),
                         s.waktu_mulai,
                         s.soal_sekarang,
@@ -2733,11 +2768,10 @@
         function broadcastStudentHeartbeat(customStatus = 'Mengerjakan') {
             if (!examState.active) return;
 
-            const normalizedKelas = normalizeClassCode(examState.student.kelas);
             const sessionPayload = {
-                nis: examState.student.nis.trim(),
-                nama: examState.student.nama.trim(),
-                kelas: normalizedKelas,
+                nis: examState.student.nis,
+                nama: examState.student.nama,
+                kelas: normalizeClassCode(examState.student.kelas),
                 waktu_mulai: examState.startTimeStr,
                 soal_sekarang: examState.currentIndex + 1,
                 terjawab: Object.keys(examState.answers).length,
@@ -2749,11 +2783,11 @@
             };
 
             const map = getLiveSessionsMap();
-            map[examState.student.nis.trim().toUpperCase()] = sessionPayload;
+            map[examState.student.nis.toUpperCase()] = sessionPayload;
             saveLiveSessionsMap(map);
 
             localStorage.setItem(OWN_ACTIVE_EXAM_KEY, JSON.stringify({
-                student: { ...examState.student, kelas: normalizedKelas },
+                student: examState.student,
                 startTimeStr: examState.startTimeStr,
                 questions: examState.questions,
                 answers: examState.answers,
@@ -2767,13 +2801,91 @@
             if (cbtChannel) {
                 cbtChannel.postMessage({ type: 'HEARTBEAT', payload: sessionPayload });
             }
+        }
 
-            // Kirim heartbeat ke Cloud setiap 9 detik agar status online siswa tampil di perangkat Admin
-            const nowTs = Date.now();
-            if (nowTs - lastCloudHeartbeatTs >= 9000 || customStatus !== 'Mengerjakan') {
-                lastCloudHeartbeatTs = nowTs;
-                pushLiveHeartbeatToCloud(sessionPayload);
+        function removeLiveSessionByNis(nis) {
+            if (!nis) return;
+            const key = String(nis).trim().toUpperCase();
+            const map = getLiveSessionsMap();
+            delete map[key];
+            saveLiveSessionsMap(map);
+        }
+
+        function startStudentHeartbeat() {
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            broadcastStudentHeartbeat('Mengerjakan');
+            pushLiveHeartbeatToCloud({
+                nis: examState.student.nis,
+                nama: examState.student.nama,
+                kelas: normalizeClassCode(examState.student.kelas),
+                waktu_mulai: examState.startTimeStr,
+                soal_sekarang: examState.currentIndex + 1,
+                terjawab: Object.keys(examState.answers).length,
+                total_soal: examState.questions.length,
+                sisa_detik: examState.remainingSeconds,
+                pelanggaran: examState.violations,
+                status: 'Mengerjakan',
+                last_heartbeat: Date.now()
+            });
+
+            let beatTick = 0;
+            heartbeatInterval = setInterval(() => {
+                if (examState.active) {
+                    beatTick++;
+                    const statusText = document.hidden ? 'Keluar Tab / Tidak Fokus' : 'Mengerjakan';
+                    broadcastStudentHeartbeat(statusText);
+                    if (beatTick % 4 === 0) {
+                        pushLiveHeartbeatToCloud({
+                            nis: examState.student.nis,
+                            nama: examState.student.nama,
+                            kelas: normalizeClassCode(examState.student.kelas),
+                            waktu_mulai: examState.startTimeStr,
+                            soal_sekarang: examState.currentIndex + 1,
+                            terjawab: Object.keys(examState.answers).length,
+                            total_soal: examState.questions.length,
+                            sisa_detik: examState.remainingSeconds,
+                            pelanggaran: examState.violations,
+                            status: statusText,
+                            last_heartbeat: Date.now()
+                        });
+                    }
+                }
+            }, 3000);
+        }
+
+        function stopStudentHeartbeat() {
+            if (heartbeatInterval) {
+                clearInterval(heartbeatInterval);
+                heartbeatInterval = null;
             }
+        }
+
+        function updateTimerDisplay() {
+            const mins = Math.floor(examState.remainingSeconds / 60);
+            const secs = examState.remainingSeconds % 60;
+            const display = document.getElementById('timerDisplay');
+            const timerBox = document.getElementById('timerBox');
+            if (display) {
+                display.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+            }
+            if (timerBox && examState.remainingSeconds <= 300) {
+                timerBox.classList.add('timer-warning', 'border-rose-500');
+            }
+        }
+
+        function startExamTimer() {
+            if (examState.timerInterval) clearInterval(examState.timerInterval);
+            updateTimerDisplay();
+            examState.timerInterval = setInterval(() => {
+                if (!examState.active) return;
+                examState.remainingSeconds--;
+                updateTimerDisplay();
+                if (examState.remainingSeconds <= 0) {
+                    clearInterval(examState.timerInterval);
+                    showToast('Waktu ujian telah habis! Jawaban dikumpulkan otomatis.', 'warning');
+                    finishExam();
+                }
+            }, 1000);
         }
 
         function restoreActiveSessionIfAny() {
@@ -2820,70 +2932,6 @@
             } catch (e) {}
         }
 
-        /**
-         * =========================================================================
-         * 5. LOGIKA UJIAN CBT (PENGACAKAN 50 SOAL & 4 OPSI A–D)
-         * =========================================================================
-         */
-        const EXAM_TOKEN = 'INF82026';
-
-        let examState = {
-            active: false,
-            enteredFullscreenAtLeastOnce: false,
-            student: { nama: '', nis: '', kelas: '' },
-            startTimeStr: '',
-            questions: [],
-            answers: {},
-            doubts: {},
-            currentIndex: 0,
-            totalSeconds: 75 * 60,
-            remainingSeconds: 75 * 60,
-            violations: 0,
-            timerInterval: null,
-            fontSize: 'md'
-        };
-
-        function fillTokenQuick() {
-            const tokenInput = document.getElementById('inputToken');
-            if (tokenInput) {
-                tokenInput.value = EXAM_TOKEN;
-                document.getElementById('tokenErrorMsg').classList.add('hidden');
-                showToast('Token ujian INF82026 telah diisikan.', 'info');
-            }
-        }
-
-        function shuffleArray(items) {
-            const arr = [...items];
-            for (let i = arr.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [arr[i], arr[j]] = [arr[j], arr[i]];
-            }
-            return arr;
-        }
-
-        function buildShuffledExamQuestions() {
-            const randomizedQuestions = shuffleArray(QUESTION_BANK);
-            return randomizedQuestions.map((item, idx) => {
-                const mappedOptions = item.options.map((optText, optIndex) => ({
-                    text: optText,
-                    isKey: optIndex === item.answer
-                }));
-                const randomizedOptions = shuffleArray(mappedOptions);
-                const newKeyIndex = randomizedOptions.findIndex(o => o.isKey);
-
-                return {
-                    no: idx + 1,
-                    id: item.id,
-                    topic: item.topic,
-                    level: item.level,
-                    stimulusKey: item.stimulusKey,
-                    question: item.question,
-                    options: randomizedOptions.map(o => o.text),
-                    correctIndex: newKeyIndex
-                };
-            });
-        }
-
         function handleStartExam(event) {
             event.preventDefault();
 
@@ -2905,7 +2953,6 @@
             }
             tokenErr.classList.add('hidden');
 
-            // Cek sistem 1x percobaan (One-Attempt Lock)
             const existingResult = checkStudentAlreadyCompleted(nis);
             if (existingResult) {
                 document.getElementById('lockedNisText').textContent = existingResult.nis || nis;
@@ -2955,51 +3002,15 @@
             startExamTimer();
             startStudentHeartbeat();
 
-            showToast('Ujian dimulai! 50 soal dan 4 opsi jawaban (A–D) telah diacak.', 'success');
-        }
-
-        function startExamTimer() {
-            if (examState.timerInterval) clearInterval(examState.timerInterval);
-            updateTimerUI();
-
-            examState.timerInterval = setInterval(() => {
-                examState.remainingSeconds--;
-                updateTimerUI();
-
-                if (examState.remainingSeconds <= 0) {
-                    clearInterval(examState.timerInterval);
-                    showToast('Waktu ujian habis! Jawaban otomatis dikumpulkan.', 'warning');
-                    finishExam();
-                }
-            }, 1000);
-        }
-
-        function updateTimerUI() {
-            const m = Math.floor(examState.remainingSeconds / 60);
-            const s = examState.remainingSeconds % 60;
-            const display = document.getElementById('timerDisplay');
-            const box = document.getElementById('timerBox');
-
-            if (display) {
-                display.textContent = `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-            }
-            if (box) {
-                if (examState.remainingSeconds <= 300) {
-                    box.classList.remove('bg-slate-900', 'border-slate-800');
-                    box.classList.add('bg-rose-600', 'timer-warning');
-                } else {
-                    box.classList.add('bg-slate-900', 'border-slate-800');
-                    box.classList.remove('bg-rose-600', 'timer-warning');
-                }
-            }
+            showToast('Ujian dimulai! Selamat mengerjakan 50 soal Informatika Kelas 8.', 'success');
         }
 
         function setQuestionFontSize(size) {
             examState.fontSize = size;
-            ['sm', 'md', 'lg'].forEach(sz => {
-                const btn = document.getElementById(`fontBtn-${sz}`);
+            ['sm', 'md', 'lg'].forEach(s => {
+                const btn = document.getElementById(`fontBtn-${s}`);
                 if (!btn) return;
-                if (sz === size) {
+                if (s === size) {
                     btn.className = 'px-2.5 py-1 rounded-lg text-xs font-bold bg-white text-indigo-700 shadow-sm transition';
                 } else {
                     btn.className = 'px-2.5 py-1 rounded-lg text-xs font-bold text-slate-600 hover:bg-white transition';
@@ -4083,6 +4094,7 @@
 
         window.addEventListener('DOMContentLoaded', () => {
             initSQLiteDatabase();
+            flushPendingCloudQueue();
         });
     </script>
 </body>
